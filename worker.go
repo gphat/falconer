@@ -1,10 +1,12 @@
 package falconer
 
 import (
+	"container/list"
 	"log"
 	"sync"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"github.com/stripe/veneur/ssf"
 )
 
@@ -28,16 +30,17 @@ type Worker struct {
 	// Intentionally not using pointers because of https://github.com/golang/go/issues/9477
 	// which implies maps without pointers are less GC-fussy since we don't have
 	// traverse the pointer
-	Items              map[int64]Item
+	Items              *list.List
 	Watches            map[string]*Watch
 	mutex              sync.Mutex
 	watchMutex         sync.Mutex
 	expirationDuration time.Duration
+	log                *logrus.Logger
 }
 
 // NewWorker creates a new worker which stores spans, handles queries and expires
 // old spans.
-func NewWorker(spanDepth int, watchDepth int, expirationDuration time.Duration) *Worker {
+func NewWorker(log *logrus.Logger, spanDepth int, watchDepth int, expirationDuration time.Duration) *Worker {
 	w := &Worker{
 		// We make our incoming span channel buffered so that we can use non-blocking
 		// writes. This improves write speed by >= 50% but risks dropping spans if
@@ -45,11 +48,12 @@ func NewWorker(spanDepth int, watchDepth int, expirationDuration time.Duration) 
 		SpanChan:           make(chan *ssf.SSFSpan, spanDepth),
 		WatchChan:          make(chan *ssf.SSFSpan, watchDepth),
 		QuitChan:           make(chan struct{}),
-		Items:              make(map[int64]Item),
+		Items:              list.New(),
 		Watches:            make(map[string]*Watch),
 		mutex:              sync.Mutex{},
 		watchMutex:         sync.Mutex{},
 		expirationDuration: expirationDuration,
+		log:                log,
 	}
 	ticker := time.NewTicker(expirationDuration)
 	// Use a ticker to periodically expire spans.
@@ -104,10 +108,10 @@ func (w *Worker) AddSpan(span *ssf.SSFSpan) {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 
-	w.Items[span.Id] = Item{
+	w.Items.PushBack(Item{
 		span:       span,
 		expiration: time.Now().Add(w.expirationDuration).Unix(),
-	}
+	})
 
 	if len(w.Watches) > 0 {
 		select {
@@ -141,7 +145,8 @@ func (w *Worker) RemoveWatch(name string) {
 // GetTrace returns all spans with the specified trace id.
 func (w *Worker) GetTrace(id int64) []*ssf.SSFSpan {
 	var spans []*ssf.SSFSpan
-	for _, item := range w.Items {
+	for e := w.Items.Front(); e != nil; e = e.Next() {
+		item := e.Value.(Item)
 		if item.span.TraceId == id {
 			spans = append(spans, item.span)
 		}
@@ -152,7 +157,8 @@ func (w *Worker) GetTrace(id int64) []*ssf.SSFSpan {
 // FindSpans returns all spans matching the specified tags to the channel provided.
 func (w *Worker) FindSpans(tags map[string]string, resultChan chan []*ssf.SSFSpan) {
 	var foundSpans []*ssf.SSFSpan
-	for _, item := range w.Items {
+	for e := w.Items.Front(); e != nil; e = e.Next() {
+		item := e.Value.(Item)
 		span := item.span
 		for fk, fv := range tags {
 			if v, ok := span.Tags[fk]; ok {
@@ -167,16 +173,29 @@ func (w *Worker) FindSpans(tags map[string]string, resultChan chan []*ssf.SSFSpa
 	resultChan <- foundSpans
 }
 
-// Sweep deletes any expired spans. The provided time is used for comparisong to
+// Sweep deletes any expired spans. The provided time is used for comparison to
 // facilitate testing.
 func (w *Worker) Sweep(expireTime int64) {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 	expired := 0
-	for key, item := range w.Items {
+	e := w.Items.Front()
+	if e == nil {
+		// Empty list!
+		return
+	}
+	for {
+		item := e.Value.(Item)
+		next := e.Next()
 		if item.expiration <= expireTime {
-			delete(w.Items, key)
+			w.Items.Remove(e)
 			expired++
 		}
+		if next == nil {
+			break
+		} else {
+			e = next
+		}
 	}
+	w.log.WithField("expired_count", expired).Debug("Expired spans")
 }
